@@ -1,6 +1,9 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_blockly_plus/flutter_blockly_plus.dart';
+import 'package:webview_flutter/webview_flutter.dart';
 
 void main() => runApp(const MaterialApp(home: BlocklyShell()));
 
@@ -12,19 +15,58 @@ class BlocklyShell extends StatefulWidget {
 }
 
 class _BlocklyShellState extends State<BlocklyShell> {
-  // 터미널 높이(드래그로 조절)
   double _terminalHeight = 200;
+  final _log = <String>[];
 
-  // 기본 툴박스(좌측)
+  BlocklyEditor? editor;
+  late final Future<void> _editorReady;
+
+  // 툴박스
   static const toolboxJson = {
     "kind": "categoryToolbox",
     "contents": [
+      {
+        "kind": "category",
+        "name": "Logic",
+        "categorystyle": "logic_category",
+        "contents": [
+          {"kind": "block", "type": "controls_if"},
+          {"kind": "block", "type": "logic_compare"},
+          {"kind": "block", "type": "logic_operation"},
+          {"kind": "block", "type": "logic_boolean"},
+        ],
+      },
       {
         "kind": "category",
         "name": "Loops",
         "categorystyle": "loop_category",
         "contents": [
           {"kind": "block", "type": "controls_repeat_ext"},
+          {"kind": "block", "type": "controls_whileUntil"},
+          {
+            "kind": "block",
+            "type": "controls_for",
+            "inputs": {
+              "FROM": {
+                "shadow": {
+                  "type": "math_number",
+                  "fields": {"NUM": 1},
+                },
+              },
+              "TO": {
+                "shadow": {
+                  "type": "math_number",
+                  "fields": {"NUM": 10},
+                },
+              },
+              "BY": {
+                "shadow": {
+                  "type": "math_number",
+                  "fields": {"NUM": 1},
+                },
+              },
+            },
+          },
         ],
       },
       {
@@ -37,11 +79,24 @@ class _BlocklyShellState extends State<BlocklyShell> {
           {"kind": "block", "type": "math_change"},
         ],
       },
+      {
+        "kind": "category",
+        "name": "Text",
+        "categorystyle": "text_category",
+        "contents": [
+          {
+            "kind": "block",
+            "type": "text",
+            "fields": {"TEXT": "Hello"},
+          },
+          {"kind": "block", "type": "text_print"},
+        ],
+      },
       {"kind": "category", "name": "Variables", "custom": "VARIABLE"},
     ],
   };
 
-  // 워크스페이스 초기 JSON(예시)
+  // 초기 상태(예시)
   final Map<String, dynamic> savedStateJson = {
     "blocks": {
       "languageVersion": 0,
@@ -58,9 +113,8 @@ class _BlocklyShellState extends State<BlocklyShell> {
 
   late final BlocklyOptions workspaceConfiguration = BlocklyOptions.fromJson({
     "toolbox": toolboxJson,
-    // 수직 툴박스 + 좌측 배치
     "horizontalLayout": false,
-    "toolboxPosition": "start", // start=좌/상, end=우/하
+    "toolboxPosition": "start",
     "move": {
       "scrollbars": {"horizontal": true, "vertical": true},
       "drag": true,
@@ -70,95 +124,224 @@ class _BlocklyShellState extends State<BlocklyShell> {
     "grid": {"spacing": 20, "length": 3, "colour": "#1f2937", "snap": true},
   });
 
-  Future<List<String>> _loadAddons() async {
-    final skin = await rootBundle.loadString('assets/blockly/toolbox_skin.js');
-    // final dialog = await rootBundle.loadString('assets/blockly/dialog_override.js');
-    return [skin /*, dialog*/];
+  @override
+  void initState() {
+    super.initState();
+    _editorReady = _initEditor();
   }
 
-  final _log = <String>[];
+  Future<void> _initEditor() async {
+    try {
+      // 1) 애드온 로드
+      final skinJs = await rootBundle.loadString('assets/blockly/toolbox_skin.js');
+      final javaGenJs = await rootBundle.loadString('assets/blockly/java_generator.js');
+      _log.add('[BOOT] addons loaded: skin=${skinJs.length}, javaGen=${javaGenJs.length}');
 
-  void _onChange(BlocklyData data) {
-    // 필요 시 코드/JSON을 터미널에 출력
-    if (data.js != null) _log.add('[JS] ${data.js}');
-    if (data.json != null) _log.add('[JSON] ${data.json}');
+      // 2) 에디터 생성
+      editor = BlocklyEditor(
+        workspaceConfiguration: workspaceConfiguration,
+        initial: savedStateJson,
+        addons: [skinJs, javaGenJs],
+        onError: (e) {
+          _log.add('[ERR] $e');
+          setState(() {});
+        },
+        onChange: (_) {},
+        onInject: (_) => _log.add('[INJECT] called'),
+      );
+
+      // 3) init 전에 WebView 컨트롤러 세팅
+      final ctrl = editor!.blocklyController;
+      await ctrl.setJavaScriptMode(JavaScriptMode.unrestricted);
+      await ctrl.setBackgroundColor(const Color(0x00000000));
+
+      // ★ JS 채널 등록: window.JavaOut.postMessage(code) 수신
+      await ctrl.addJavaScriptChannel(
+        'JavaOut',
+        onMessageReceived: (JavaScriptMessage msg) {
+          final code = msg.message;
+          _log.add('[JAVA]\n$code'); // 앱 내 터미널
+          debugPrint('[JAVA from channel]\n$code'); // Flutter 콘솔
+          setState(() {});
+        },
+      );
+
+      await ctrl.setNavigationDelegate(
+        NavigationDelegate(
+          onPageStarted: (url) {
+            _log.add('[WEB] onPageStarted: $url');
+            setState(() {});
+          },
+          onPageFinished: (url) async {
+            _log.add('[WEB] onPageFinished: $url');
+            _log.add(
+              '[WEB] ready=${await _ret('document.readyState')}, Blockly=${await _ret('typeof window.Blockly')}, workspace=${await _ret('(window.Blockly&&Blockly.getMainWorkspace)? "ok":"no"')}, JavaGen=${await _ret('(window.__JAVA_GEN_OK__===true)?"ok":"no"')}',
+            );
+            setState(() {});
+          },
+          onWebResourceError: (err) {
+            _log.add('[WEB-ERR] $err');
+            setState(() {});
+          },
+        ),
+      );
+
+      // 4) 초기화 + HTML 로드
+      editor!.init();
+      _log.add('[BOOT] editor.init() called (after JS+delegate set)');
+
+      final html = editor!.htmlRender();
+      _log.add('[BOOT] htmlRender length=${html.length}');
+      await ctrl.loadHtmlString(html);
+      _log.add('[BOOT] loadHtmlString called');
+    } catch (e) {
+      _log.add('[BOOT-ERR] $e');
+      setState(() {});
+    }
+  }
+
+  Future<String> _ret(String js) async {
+    try {
+      final raw = await editor!.blocklyController.runJavaScriptReturningResult(js);
+      if (raw is String && raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')) {
+        return raw.substring(1, raw.length - 1);
+      }
+      return raw?.toString() ?? 'null';
+    } catch (e) {
+      _log.add('[JS-ERR] $e');
+      setState(() {});
+      return 'ERR';
+    }
+  }
+
+  // ▶ 실행: JS에서 JavaOut 채널로 push
+  Future<void> _runAndPushViaChannel() async {
+    final ctrl = editor?.blocklyController;
+    if (ctrl == null) {
+      _log.add('[RUN-ERR] controller=null');
+      setState(() {});
+      return;
+    }
+    try {
+      await ctrl.runJavaScriptReturningResult('window.BlocklyJavaSend()');
+      _log.add(
+        '[RUN] ready=${await _ret('document.readyState')}, Blockly=${await _ret('typeof window.Blockly')}, ws=${await _ret('(window.Blockly&&Blockly.getMainWorkspace)? "ok":"no"')}, JavaGen=${await _ret('(window.__JAVA_GEN_OK__===true)?"ok":"no"')}',
+      );
+    } catch (e) {
+      _log.add('[RUN-ERR] $e');
+      setState(() {});
+    }
+    setState(() {});
+  }
+
+  // 🐞 Ping (요약)
+  Future<void> _ping() async {
+    final ctrl = editor?.blocklyController;
+    if (ctrl == null) return;
+    try {
+      final genState = await ctrl.runJavaScriptReturningResult(
+        '(function(){return (window.__JAVA_GEN_OK__===true)?"ok":(window.__installJavaGenerator?(__installJavaGenerator()?"installed":"fail"):"no_fn");})()',
+      );
+      final snapJs = r'''
+        (function(){
+          try{
+            var ws = (window.Blockly && Blockly.getMainWorkspace) ? Blockly.getMainWorkspace() : null;
+            var res = {
+              ready: (typeof document!=='undefined')?document.readyState:null,
+              hasBlockly: (typeof window.Blockly),
+              ver: (window.Blockly && (Blockly.VERSION || Blockly.version || null)) || null,
+              ws: !!ws,
+              blocks: ws && ws.getAllBlocks ? ws.getAllBlocks(false).length : null,
+              javaGenOk: !!window.__JAVA_GEN_OK__,
+              hasFinish: !!(window.Blockly && Blockly.Java && Blockly.Java.finish),
+              varGet: !!(window.Blockly && Blockly.Java && (typeof Blockly.Java['variables_get']==='function')),
+              varSet: !!(window.Blockly && Blockly.Java && (typeof Blockly.Java['variables_set']==='function')),
+              mathChange: !!(window.Blockly && Blockly.Java && (typeof Blockly.Java['math_change']==='function'))
+            };
+            try{
+              var keys=[];
+              if (window.Blockly && Blockly.Java){
+                for (var k in Blockly.Java){
+                  if (typeof Blockly.Java[k]==='function' && !/^[A-Z_]+$/.test(k)) keys.push(k);
+                }
+              }
+              res.handlers = keys.sort();
+            }catch(e){}
+            return JSON.stringify(res);
+          }catch(e){return JSON.stringify({fatal:String(e)})}
+        })();
+      ''';
+      final raw = await ctrl.runJavaScriptReturningResult(snapJs);
+      final s = raw?.toString() ?? '{}';
+      final jsonStr = (s.startsWith('"') && s.endsWith('"')) ? s.substring(1, s.length - 1) : s;
+      final Map<String, dynamic> d = jsonDecode(jsonStr);
+      _log.add("[DBG] genState=$genState");
+      _log.add(
+        "[DBG] ready=${d['ready']}, Blockly=${d['hasBlockly']}, ver=${d['ver']}, ws=${d['ws']}, blocks=${d['blocks']}",
+      );
+      _log.add(
+        "[DBG] javaGenOk=${d['javaGenOk']}, hasFinish=${d['hasFinish']}, varGet=${d['varGet']}, varSet=${d['varSet']}, mathChange=${d['mathChange']}",
+      );
+      _log.add("[DBG] handlers=${d['handlers']}");
+    } catch (e) {
+      _log.add('[DBG-ERR] $e');
+    }
     setState(() {});
   }
 
   @override
   Widget build(BuildContext context) {
-    const splitterHeight = 8.0; // 드래그 핸들 높이
-    const minWorkspaceHeight = 160.0; // 워크스페이스 최소 보장 높이
+    const splitterHeight = 8.0;
+    const minWorkspaceHeight = 160.0;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Blockly + Terminal Layout')),
+      appBar: AppBar(
+        title: const Text('Blockly + Terminal Layout (Channel)'),
+        actions: [
+          IconButton(icon: const Icon(Icons.bug_report), onPressed: _ping),
+          IconButton(icon: const Icon(Icons.play_arrow), onPressed: _runAndPushViaChannel),
+        ],
+      ),
       body: SafeArea(
-        // 하단 제스처/네비게이션바 인셋 반영
-        child: FutureBuilder<List<String>>(
-          future: _loadAddons(),
+        child: FutureBuilder<void>(
+          future: _editorReady,
           builder: (context, snap) {
-            if (!snap.hasData) {
+            if (snap.connectionState != ConnectionState.done || editor == null) {
               return const Center(child: CircularProgressIndicator());
             }
-
             return LayoutBuilder(
               builder: (context, c) {
-                final double h = c.maxHeight;
-                final double w = c.maxWidth;
-
-                // 터미널 높이 최대값: 전체 - 워크스페이스 최소 - 스플리터
-                final double maxTerminal = (h - minWorkspaceHeight - splitterHeight).clamp(0.0, h);
-                // NOTE: clamp의 반환형이 num → double로 변환
-                final double terminalHeight = _terminalHeight.clamp(120.0, maxTerminal).toDouble();
-
-                // 상단 워크스페이스 실제 높이
-                final double workspaceHeight = (h - terminalHeight - splitterHeight).clamp(0.0, h).toDouble();
+                final h = c.maxHeight;
+                final w = c.maxWidth;
+                final maxTerminal = (h - minWorkspaceHeight - splitterHeight).clamp(0.0, h);
+                final terminalHeight = _terminalHeight.clamp(120.0, maxTerminal).toDouble();
+                final workspaceHeight = (h - terminalHeight - splitterHeight).toDouble();
 
                 return Column(
                   children: [
-                    // 상단: 블록 워크스페이스(툴박스는 WebView 내부 좌측)
                     SizedBox(
                       height: workspaceHeight,
                       width: w,
-                      child: BlocklyEditorWidget(
-                        workspaceConfiguration: workspaceConfiguration,
-                        initial: savedStateJson,
-                        addons: snap.data!,
-                        // CSS/JS 주입
-                        debug: false,
-                        onChange: _onChange,
-                        onError: (err) => _log.add('[ERR] $err'),
-                      ),
+                      child: WebViewWidget(controller: editor!.blocklyController),
                     ),
-
-                    // 드래그 핸들(스플리터)
                     GestureDetector(
                       behavior: HitTestBehavior.opaque,
                       onVerticalDragUpdate: (d) {
-                        setState(() {
-                          _terminalHeight = (_terminalHeight - d.delta.dy);
-                        });
+                        setState(() => _terminalHeight = (_terminalHeight - d.delta.dy));
                       },
                       child: Container(
                         color: Colors.grey.shade400,
                         height: splitterHeight,
                         width: double.infinity,
                         alignment: Alignment.center,
-                        child: Container(
-                          width: 60,
-                          height: 3,
-                          color: Colors.grey.shade700,
-                        ),
+                        child: Container(width: 60, height: 3, color: Colors.grey.shade700),
                       ),
                     ),
-
-                    // 하단: 터미널
                     Container(
                       height: terminalHeight,
                       width: double.infinity,
                       color: const Color(0xFF111827),
                       child: Padding(
-                        // 하단 시스템 인셋만 추가 보정
                         padding: EdgeInsets.only(
                           left: 12,
                           right: 12,
